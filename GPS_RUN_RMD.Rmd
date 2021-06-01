@@ -1,0 +1,212 @@
+---
+title: "GPS를 통한 달리기 트랙킹"
+author: "Jiehwan Yang"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## 1. Intro
+[지난 UBER 포스트](https://rpubs.com/Oleole/uberuseranalysis) 에서는 각 Ride event에 대한 데이터를 살펴보았다. 그 이후에 시간에 따른 위치를 트래킹하는 GPS 데이터를 한 번 분석해보고 싶었다.
+
+GPS 데이터를 찾아보다가 독일에 어느 언어학 박사님이 올려놓은 [러닝 데이터](http://www.wolferonline.de/uploads/run.gpx)를 발견했다. 혹시 데이터를 이용해 분석 내용을 포스팅해도 되는지 정중히 여쭤봤고, 바로 다음날 사용해도 좋다고 연락을 받았다. HUGE thanks to Sascha Wolfer! 아래는 받은 이메일이다.
+
+
+![](C:\Users\82104\Desktop\GPS_Run\email_GPS.png)
+
+
+
+## 2. Data
+```{r echo=FALSE, warning=FALSE, message=FALSE}
+library(XML)
+library(lubridate)
+library(dplyr)
+library(raster)
+library(gridExtra)
+library(scales)
+library(ggplot2)
+library(ggthemes)
+library(gganimate)
+library(gifski)
+library(ggmap)
+library(plotly)
+library(knitr)
+library(rmarkdown)
+library()
+```
+
+```{r echo=FALSE, warning=FALSE, message=FALSE}
+# Import data file
+download.file("http://www.wolferonline.de/uploads/run.gpx", "run.gpx")
+
+gpxfile<- htmlTreeParse("run.gpx", useInternalNodes = TRUE)
+
+# Extract data
+coordinates <- xpathSApply(gpxfile, path = "//trkpt", xmlAttrs)
+lat_vector<- as.numeric(coordinates["lat",])
+long_vector<- as.numeric(coordinates["lon",])
+
+elevations <- as.numeric(xpathSApply(gpxfile, path = "//trkpt/ele", xmlValue))
+times <- xpathSApply(gpxfile, path = "//trkpt/time", xmlValue)
+
+
+# Create a new data frame with extracted data
+run_df <- data.frame(lat = lat_vector, long = long_vector, ele = elevations, time = times)
+```
+
+```{r echo=FALSE, warning=FALSE, message=FALSE}
+# Feature Engineering: Distance, Time, Distance
+# Add columns preceding its long & lat
+# Convert type of time
+run_df<- run_df %>% mutate(lat_next = lead(lat, 1),
+                           long_next = lead(long, 1),
+                           time = ymd_hms(time))
+
+run_df$dist <- apply(run_df, 1, FUN = function (i) {
+          pointDistance(c(as.numeric(i["lat_next"]), as.numeric(i["long_next"])),
+                        c(as.numeric(i["lat"]), as.numeric(i["long"])),
+                        lonlat = TRUE)
+})
+
+run_df<- run_df %>% mutate(time_next = lead(time, 1),
+                           time_diff = as.numeric(time_next - time),
+                           speed_km_per_hour = dist / time_diff * 3.6,
+                           speed_km_per_hour = ifelse(is.na(speed_km_per_hour), 0, speed_km_per_hour),
+                           lowess_ele = lowess(ele, f = 0.15)$y,
+                           lowess_speed = lowess(speed_km_per_hour, f = 0.15)$y
+                           )
+
+run_df %>% paged_table()
+```
+========================================================================================================================
+
+- GPS 데이터 형식 (GPX) 으로 설계된 XML 스키마 파일을 필요한 컬럼들 (거리, 시간, 속도 등)을 추가해 데이터프레임으로 변환해주었다. 자세한 코드는 [여기](https://github.com/jiehwan94)를 참고하면 된다.
+
+- 시간 `time`에 따라 해발고도 `elevation`, 위치 `lat` `long`와 속도 `speed_km_per_hour`가 있는 데이터이다.
+
+
+
+
+## 3. Visualization
+
+```{r echo=FALSE, warning=FALSE, message=FALSE}
+googleAPIkey<- "AIzaSyCkLBuvcmCQgnfZ3HhtJzQaaNAigQo3Pow"
+register_google(googleAPIkey)
+
+run_map <- get_map(location = c(lon = mean(run_df$long), lat = mean(run_df$lat)),
+                   zoom = 14, maptype='roadmap')
+
+run_map_animation<- ggmap(run_map) +
+                      geom_point(
+                        data = run_df,
+                        aes(x = long,
+                            y = lat,
+                            color = time)) +
+                      scale_color_gradient("time", low = "#FFAF88", high = "#FF5400",
+                                           trans = time_trans()) +
+                      transition_manual(run_df$time, cumulative = TRUE) +
+                      ease_aes("linear") +
+                    labs(title = "러닝 트랙 코스")
+
+# Takes a while to render...
+run_map_animation
+
+```
+
+========================================================================================================================
+
+- 시간에 따라 animation을 그려서 어떤 코스를 뛰었는지 알 수 있다.
+
+========================================================================================================================
+
+```{r echo=FALSE, warning=FALSE, message=FALSE}
+ele_plot<- ggplot(run_df, aes(x = seq_along(ele),
+                   y = ele)) +
+  geom_line() +
+  geom_line(aes(x = seq_along(ele),
+                y = lowess_ele),
+            color = "red",
+            size = 2) +
+  geom_hline(yintercept = mean(run_df$ele),
+             color = "green") +
+  labs(title = "Change in Elevation",
+       x = "GPS Sequence",
+       y = "Elevation (in meters)") +
+  annotate("rect", xmin = 450, xmax = 550, ymin = -Inf, ymax = Inf,
+           alpha = .1,fill = "blue") +
+  annotate("text", x = 500, y = 270, label= "평지", size = 4) +
+  annotate("rect", xmin = 700, xmax = 800, ymin = -Inf, ymax = Inf,
+           alpha = .1,fill = "blue") +
+  annotate("text", x = 750, y = 270, label= "오르막길", size = 4) +
+  theme_bw()
+
+speed_plot<- ggplot(run_df, aes(x = seq_along(speed_km_per_hour),
+                   y = speed_km_per_hour)) +
+  geom_line() +
+  geom_line(aes(x = seq_along(lowess_speed),
+                y = lowess_speed),
+            color = "red",
+            size = 2) +
+  geom_hline(yintercept = mean(run_df$speed_km_per_hour),
+             color = "green") +
+  labs(title = "Change in Speed",
+       x = "GPS Sequence",
+       y = "Speed (km per hour") +
+  annotate("rect", xmin = 450, xmax = 550, ymin = -Inf, ymax = Inf,
+           alpha = .1,fill = "blue") +
+  annotate("text", x = 500, y = 2, label= "평지", size = 4) +
+  annotate("rect", xmin = 700, xmax = 800, ymin = -Inf, ymax = Inf,
+           alpha = .1,fill = "blue") +
+  annotate("text", x = 750, y = 2, label= "오르막길", size = 4) +
+  theme_bw()
+
+speed_p<- ggmap(run_map) +
+  geom_point(
+    data = run_df,
+    aes(x = long,
+        y = lat,
+        color = speed_km_per_hour)) +
+  scale_color_gradient(low = "#FFFFFF", high = "#184F98", name = "속도") +
+  labs(title = "시간에 따른 속도")
+
+elevation_p<- ggmap(run_map) +
+  geom_point(
+    data = run_df,
+    aes(x = long,
+        y = lat,
+        color = ele)) +
+  scale_color_gradient(low = "#FFFFFF", high = "#184F98", name = "고도") +
+  labs(title = "시간에 따른 해발고도")
+
+gridExtra::grid.arrange(ele_plot, elevation_p, speed_plot, speed_p)
+
+```
+
+========================================================================================================================
+
+- 초록선은 평균 값을 나타낸다.
+
+- 평지에서는 속도가 평균을 웃도는 것을 확인할 수 있다.
+
+- 마지막 오르막길에서 속도가 급격히 떨어졌다가 마지막 스퍼트를 낸 것을 알 수 있다.
+
+- 마지막 평지에서는 아마 체력저하로 인해 속도가 평균을 밑도는 것을 확인할 수 있다.
+
+
+
+
+
+## 4. 마치며...
+
+
+- GPX 데이터는 처음 살펴보았는데 UBER나 SOCAR 같은 모빌리티 회사에서는 GPS 데이터를 어떤 용도로 활용할지 궁금해졌다. SOCAR의 경우, 운전자의 운전 습관을 트래킹해서 보험 요금에 반영하는 용도로 쓰지 않을까? 그런데 생각해보면 코너링 속도나 급정거 같은 경우를 트랙하고자 할 경우, GPS가 약간의 오차가 있기 때문에 가속센서를 장착해 모은 데이터를 보험금 책정에 반영하지 않을까 싶기도 하다. 운전 데이터가 없는 첫 사용자의 경우, 보험금을 보수적으로 높게 책정할까?
+
+- 나만의 GPS 데이터를 분석해보고 싶었다. 요즘 친구들이 NIKE 앱을 통해서 자신의 한강 Running Time을 공유하고 하던데 나도 몸이 회복되면 데이터를 모아 분석해보고 싶다. 풋살이나 축구를 할 때 데이터를 모아서 heatmap이나 내 속도 및 뛴 거리 등을 측정해보는 것도 재미있을 것 같다.
+
+- 재미있는 상식: GPS는 1970년대 미국 국방부에서 개발되어 미사일 타격 정확도를 높이기 위해 사용되었다고 한다. 1984년에 민간에 공개돼 선박과 비행기의 항로 개선에 이용되었고, 2000년 대에 들어서야 차량용 내비게이션 등에 쓰이기 시작했다. 개발에 든 비용이 연간 약 7.5억 달러라는데 이를 무료로 배포한 갓아메리카. 무력의 용도로 개발된 기술이 현재 우리 삶에 큰 도움을 준다는 것이 아이러니하다.
+
